@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fire Command Incident Map</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111820; --panel:#1e2834; --line:#344150; --text:#eef3f8; --muted:#aab7c5; --red:#d92d20; }
+    * { box-sizing: border-box; }
+    html, body { height:100%; width:100%; margin:0; overflow:hidden; font-family:Segoe UI,Arial,sans-serif; background:var(--bg); color:var(--text); }
+    #app { height:100%; display:flex; flex-direction:column; }
+    #toolbar { min-height:76px; display:flex; align-items:center; gap:18px; padding:12px 18px; background:#18212b; border-bottom:1px solid var(--line); }
+    #heading { min-width:205px; }
+    #heading strong { display:block; font-size:15px; letter-spacing:.7px; }
+    #heading span { display:block; margin-top:4px; color:var(--muted); font-size:11px; }
+    #searchPanel { flex:1; min-width:150px; max-width:620px; }
+    #searchPanel.place-hidden { display:none; }
+    gmp-place-autocomplete { width:100%; --gmpx-color-surface: #263342; --gmpx-color-on-surface: #f2f5f8; --gmpx-color-primary: #ef5350; }
+    #mapStatus { margin-left:auto; color:var(--muted); font-size:12px; white-space:nowrap; }
+    #map { flex:1; min-height:0; width:100%; background:#dfe6ed; }
+    #pickerFooter { display:none; padding:12px 18px; align-items:center; gap:16px; background:#18212b; border-top:1px solid var(--line); }
+    #pickerFooter.visible { display:flex; }
+    #selectedLocation { flex:1; min-width:0; color:var(--muted); font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
+    #confirmLocation { border:0; border-radius:7px; background:#d92d20; color:white; font-weight:700; padding:11px 18px; cursor:pointer; }
+    #confirmLocation:disabled { opacity:.45; cursor:not-allowed; }
+    #mapError { display:none; position:absolute; left:18px; right:18px; top:88px; z-index:10; padding:12px 15px; background:#4c2023; border:1px solid #a94343; border-radius:8px; color:#fff; font-size:13px; }
+    #mapError.visible { display:block; }
+    .incident-info { width:260px; color:#17212b; font:13px Segoe UI,Arial,sans-serif; }
+    .incident-info h3 { margin:0 0 9px; color:#b42318; font-size:15px; }
+    .incident-info .row { margin:5px 0; line-height:1.35; }
+    .incident-info .key { color:#596675; font-weight:600; }
+    .incident-info button { margin-top:10px; width:100%; padding:9px; border:0; border-radius:5px; color:#fff; background:#c62828; font-weight:700; cursor:pointer; }
+    .incident-info button:disabled { background:#77818c; cursor:not-allowed; }
+    @media (max-width:650px) { #toolbar { flex-wrap:wrap; gap:8px; } #heading { min-width:100%; } #mapStatus { margin-left:0; } #pickerFooter { align-items:stretch; flex-direction:column; } }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="toolbar">
+    <div id="heading">
+      <strong id="pageTitle">FIRE INCIDENT MAP</strong>
+      <span id="pageSubtitle">Registered incidents with saved coordinates</span>
+    </div>
+    <div id="searchPanel"></div>
+    <div id="mapStatus">Connecting to Google Maps…</div>
+  </div>
+  <div id="mapError"></div>
+  <div id="map" aria-label="Google map"></div>
+  <div id="pickerFooter">
+    <div id="selectedLocation">Search for a place or click the map to choose a location.</div>
+    <button id="confirmLocation" disabled>Confirm Location</button>
+  </div>
+</div>
+
+<script src="/google-maps-config.js"></script>
+<script>
+  const query = new URLSearchParams(window.location.search);
+  const pickerMode = query.get('mode') === 'picker';
+  let map;
+  let pickerMarker;
+  let selectedLatLng = null;
+  let selectedAddress = '';
+  let incidentMarkers = [];
+  let pendingIncidents = null;
+  let infoWindow;
+  let PinElementClass;
+  let AdvancedMarkerElementClass;
+
+  const errorBox = document.getElementById('mapError');
+  const statusBox = document.getElementById('mapStatus');
+  const selectedLocationBox = document.getElementById('selectedLocation');
+  const confirmButton = document.getElementById('confirmLocation');
+
+  if (pickerMode) {
+    document.getElementById('pageTitle').textContent = 'SELECT INCIDENT LOCATION';
+    document.getElementById('pageSubtitle').textContent = 'Search for an address or click anywhere on the map';
+    document.getElementById('pickerFooter').classList.add('visible');
+    statusBox.textContent = 'Choose a location, then confirm';
+  }
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.classList.add('visible');
+    statusBox.textContent = 'Map unavailable';
+  }
+  window.addEventListener('error', function(event) {
+    console.error('JavaScript error:', event.message);
+
+    showError(
+        'JAVASCRIPT ERROR: ' +
+        event.message
+    );
+});
+
+window.addEventListener('unhandledrejection', function(event) {
+    console.error('Promise error:', event.reason);
+
+    showError(
+        'PROMISE ERROR: ' +
+        (event.reason?.message || String(event.reason))
+    );
+});
+  window.gm_authFailure = function () {
+    showError('Google Maps authorization failed. Check the local API key, billing status, enabled APIs, and the HTTP referrer restriction for http://127.0.0.1/* (or the authorized localhost pattern).');
+  };
+
+  function escapeHtml(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    })[c]);
+  }
+
+  function setPickerLocation(position, address) {
+    selectedLatLng = { lat: position.lat, lng: position.lng };
+    selectedAddress = address || `Selected location (${position.lat.toFixed(6)}, ${position.lng.toFixed(6)})`;
+    if (pickerMarker) {
+      pickerMarker.position = selectedLatLng;
+    } else {
+      const pin = new PinElementClass({ background:'#d92d20', borderColor:'#991b1b', glyphColor:'#ffffff', glyphText:'!', scale:1.15 });
+      pickerMarker = new AdvancedMarkerElementClass({ map, position:selectedLatLng, title:'Selected incident location' });
+      pickerMarker.append(pin);
+    }
+    map.panTo(selectedLatLng);
+    map.setZoom(Math.max(map.getZoom() || 14, 15));
+    selectedLocationBox.textContent = `${selectedAddress}  |  ${position.lat.toFixed(6)}, ${position.lng.toFixed(6)}`;
+    confirmButton.disabled = false;
+  }
+
+  async function initializeMap() {
+    if (!window.FSMS_GOOGLE_MAPS_API_KEY || window.FSMS_GOOGLE_MAPS_API_KEY === 'YOUR_GOOGLE_MAPS_API_KEY') {
+      showError('Google Maps API key is not configured. Copy config/google-maps-config.example.js to config/google-maps-config.js and add your key locally.');
+      return;
+    }
+
+    try {
+      const [{ Map, InfoWindow }, { PlaceAutocompleteElement }, { AdvancedMarkerElement, PinElement }] = await Promise.all([
+        google.maps.importLibrary('maps'),
+        google.maps.importLibrary('places'),
+        google.maps.importLibrary('marker')
+      ]);
+      PinElementClass = PinElement;
+      AdvancedMarkerElementClass = AdvancedMarkerElement;
+      map = new Map(document.getElementById('map'), {
+        center: { lat:23.8103, lng:90.4125 },
+        zoom: 11,
+        mapId: 'DEMO_MAP_ID',
+        mapTypeControl: true,
+        streetViewControl: true,
+        fullscreenControl: true,
+        clickableIcons: true
+      });
+      infoWindow = new InfoWindow();
+      if (!pickerMode) {
+      map.addListener('click', () => {
+          infoWindow.close();
+      });
+}
+      const autocomplete = new PlaceAutocompleteElement();
+      autocomplete.setAttribute('placeholder', 'Search an address, landmark or place');
+      document.getElementById('searchPanel').appendChild(autocomplete);
+      autocomplete.addEventListener('gmp-select', async ({ placePrediction }) => {
+        try {
+          const place = placePrediction.toPlace();
+          await place.fetchFields({ fields:['displayName', 'formattedAddress', 'location'] });
+          if (!place.location) return;
+          const position = { lat:place.location.lat(), lng:place.location.lng() };
+          if (pickerMode) {
+            setPickerLocation(position, place.formattedAddress || place.displayName || 'Selected place');
+          } else {
+            map.panTo(position);
+            map.setZoom(16);
+          }
+        } catch (error) {
+          console.error('Places search failed', error);
+          showError('The place details could not be loaded. Check Places API (New), billing, and the API key restrictions.');
+        }
+      });
+
+      if (pickerMode) {
+        map.addListener('click', event => {
+          if (!event.latLng) return;
+          const position = { lat:event.latLng.lat(), lng:event.latLng.lng() };
+          setPickerLocation(position, `Map location (${position.lat.toFixed(6)}, ${position.lng.toFixed(6)})`);
+        });
+        confirmButton.addEventListener('click', () => {
+    console.log("Confirm button clicked");
+
+    if (!selectedLatLng) {
+        alert("Please select a location first.");
+        return;
+    }
+
+    if (typeof window.fsmsPickerConfirmed !== 'function') {
+        alert("Java callback is not available.");
+        return;
+    }
+
+    alert("Sending location to Java...");
+
+    window.fsmsPickerConfirmed(
+        String(selectedLatLng.lat) + "|" +
+        String(selectedLatLng.lng) + "|" +
+        encodeURIComponent(selectedAddress || "")
+    );
+});
+        selectedLocationBox.textContent = 'Search for a place or click the map to choose a location.';
+      } else {
+        document.getElementById('searchPanel').classList.add('place-hidden');
+        statusBox.textContent = 'Waiting for incident records…';
+        if (pendingIncidents !== null) {
+          const incidentsToRender = pendingIncidents;
+          pendingIncidents = null;
+          renderIncidents(incidentsToRender);
+        }
+      }
+      setTimeout(() => {
+        if (!map) showError('Google Maps did not initialize. Check the network connection, API key, billing and browser console.');
+      }, 12000);
+    } catch (error) {
+    console.error('Map initialization failed:', error);
+
+    showError(
+        'MAP INITIALIZATION ERROR: ' +
+        (error.message || String(error))
+    );
+    }
+  }
+
+  function clearIncidentMarkers() {
+    incidentMarkers.forEach(marker => marker.map = null);
+    incidentMarkers = [];
+  }
+
+  function renderIncidents(incidents) {
+    if (!map || !AdvancedMarkerElementClass || !PinElementClass) {
+      pendingIncidents = Array.isArray(incidents) ? incidents : [];
+      return;
+    }
+    clearIncidentMarkers();
+    const bounds = new google.maps.LatLngBounds();
+    let validCount = 0;
+
+    (Array.isArray(incidents) ? incidents : []).forEach(incident => {
+      const lat = Number(incident.latitude);
+      const lng = Number(incident.longitude);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) return;
+      const position = { lat, lng };
+      const pin = new PinElementClass({ background:'#d92d20', borderColor:'#991b1b', glyphColor:'#ffffff', glyphText:'!', scale:1.15 });
+      const marker = new AdvancedMarkerElementClass({
+        map,
+        position,
+        title:`Incident #${incident.id} — ${incident.threat || 'Incident'}`,
+        gmpClickable:true
+      });
+      marker.append(pin);
+      marker.addEventListener('gmp-click', () => openIncidentInfo(marker, incident));
+      incidentMarkers.push(marker);
+      bounds.extend(position);
+      validCount++;
+    });
+
+    if (validCount === 0) {
+      statusBox.textContent = 'No incidents have valid saved coordinates';
+      map.setCenter({ lat:23.8103, lng:90.4125 });
+      map.setZoom(11);
+      return;
+    }
+    statusBox.textContent = `${validCount} mapped incident${validCount === 1 ? '' : 's'}`;
+    if (validCount === 1) {
+      map.setCenter(bounds.getCenter());
+      map.setZoom(15);
+    } else {
+      map.fitBounds(bounds, 70);
+    }
+  }
+
+  function openIncidentInfo(marker, incident) {
+    const canDispatch = String(incident.status).toLowerCase() !== 'resolved';
+    const dispatchMarkup = canDispatch
+      ? `<button id="dispatch-incident-${Number(incident.id)}" type="button">Dispatch</button>`
+      : '<button type="button" disabled>Resolved — Dispatch unavailable</button>';
+    const content = `
+      <div class="incident-info">
+        <h3>Emergency Incident #${escapeHtml(incident.id)}</h3>
+        <div class="row"><span class="key">Threat:</span> ${escapeHtml(incident.threat)}</div>
+        <div class="row"><span class="key">Severity:</span> ${escapeHtml(incident.severity)}</div>
+        <div class="row"><span class="key">Street:</span> ${escapeHtml(incident.street)}</div>
+        <div class="row"><span class="key">City:</span> ${escapeHtml(incident.city)}</div>
+        <div class="row"><span class="key">Status:</span> ${escapeHtml(incident.status)}</div>
+        <div class="row"><span class="key">Incident date:</span> ${escapeHtml(incident.date)}</div>
+        ${dispatchMarkup}
+      </div>`;
+    infoWindow.setContent(content);
+    infoWindow.open({ map, anchor:marker });
+    if (canDispatch) {
+      google.maps.event.addListenerOnce(infoWindow, 'domready', () => {
+        const button = document.getElementById(`dispatch-incident-${Number(incident.id)}`);
+          if (button) {
+          button.addEventListener('click', () => {
+              if (typeof window.fsmsDispatchIncident === 'function') {
+                  window.fsmsDispatchIncident(String(incident.id));
+              } else {
+                  console.error('Java dispatch callback is unavailable.');
+              }
+          });
+        }
+      });
+    }
+  }
+
+  // Load Maps JS using Google's dynamic library bootstrap. The key is read from the ignored local config file.
+  (g => {
+    let h, a, k, p = 'The Google Maps JavaScript API', c = 'google', l = 'importLibrary', q = '__ib__', m = document, b = window;
+    b = b[c] || (b[c] = {});
+    const d = b.maps || (b.maps = {}), r = new Set(), e = new URLSearchParams();
+    const u = () => h || (h = new Promise(async (resolve, reject) => {
+      a = m.createElement('script');
+      e.set('libraries', [...r] + '');
+      for (k in g) e.set(k.replace(/[A-Z]/g, t => '_' + t[0].toLowerCase()), g[k]);
+      e.set('callback', c + '.maps.' + q);
+      a.src = 'https://maps.' + c + 'apis.com/maps/api/js?' + e.toString();
+      d[q] = resolve;
+      a.onerror = () => reject(Error(p + ' could not load.'));
+      a.async = true;
+      m.head.append(a);
+    }));
+    if (d[l]) console.warn(p + ' only loads once.');
+    else d[l] = (f, ...n) => r.add(f) && u().then(() => d[l](f, ...n));
+  })({ key:window.FSMS_GOOGLE_MAPS_API_KEY || '', v:'weekly' });
+
+  google.maps.importLibrary('maps')
+    .then(initializeMap)
+    .catch(error => {
+        console.error('Google Maps loading error:', error);
+
+        showError(
+            'GOOGLE MAPS LOADING ERROR: ' +
+            (error.message || String(error))
+        );
+    });
+</script>
+</body>
+</html>
