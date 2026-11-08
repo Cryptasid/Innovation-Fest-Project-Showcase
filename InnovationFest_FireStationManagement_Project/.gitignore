@@ -1,0 +1,10 @@
+# Local Google Maps browser key (served only by the application's local map server)
+/config/google-maps-config.js
+
+# Java build output
+/bin/
+/out/
+*.class
+
+# VS Code workspace state
+.vscode/*.log
